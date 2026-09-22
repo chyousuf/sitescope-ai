@@ -2,7 +2,6 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const fs = require('fs');
-const { v4: uuidv4 } = require('crypto');
 const { db } = require('./db');
 const { validateAuditUrl } = require('./safety');
 const { crawlDomain, inspectRobotsAndSitemaps } = require('./crawler');
@@ -14,15 +13,28 @@ const demoSiteRouter = require('./demoSite');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const isVercel = process.env.VERCEL === '1' || !!process.env.NOW_REGION || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
 
 app.use(cors());
 app.use(express.json());
 
 // Serve static screenshots
 app.use('/screenshots', express.static(SCREENSHOTS_DIR));
+const distScreenshots = path.join(__dirname, '..', 'dist', 'screenshots');
+if (fs.existsSync(distScreenshots)) {
+  app.use('/screenshots', express.static(distScreenshots));
+}
+
+// Router to handle both /api/* and /* paths transparently in serverless
+const apiRouter = express.Router();
 
 // Mount built-in demo site
-app.use('/api', demoSiteRouter);
+apiRouter.use(demoSiteRouter);
+
+// Health check endpoint
+apiRouter.get('/health', (req, res) => {
+  res.json({ status: 'ok', serverless: isVercel, timestamp: new Date().toISOString() });
+});
 
 // In-memory SSE connections for active audits
 const auditEventStreams = new Map();
@@ -40,7 +52,7 @@ function sendSseEvent(auditId, type, data) {
 // -------------------------------------------------------------
 // SSE Endpoint for Live Audit Progress
 // -------------------------------------------------------------
-app.get('/api/audits/:id/stream', (req, res) => {
+apiRouter.get('/audits/:id/stream', (req, res) => {
   const auditId = req.params.id;
 
   res.setHeader('Content-Type', 'text/event-stream');
@@ -67,7 +79,7 @@ app.get('/api/audits/:id/stream', (req, res) => {
 // -------------------------------------------------------------
 // Start Audit Endpoint
 // -------------------------------------------------------------
-app.post('/api/audits', async (req, res) => {
+apiRouter.post('/audits', async (req, res) => {
   const { url, auditType = 'single', maxPages = 5, apiKey = null } = req.body;
 
   if (!url) {
@@ -439,7 +451,7 @@ async function runAuditPipeline(auditId, targetUrl, domain, auditType, maxPages,
 // -------------------------------------------------------------
 
 // List Audits
-app.get('/api/audits', (req, res) => {
+apiRouter.get('/audits', (req, res) => {
   const audits = db.prepare(`
     SELECT a.*, 
       (SELECT COUNT(*) FROM findings WHERE audit_id = a.id) as findings_count,
@@ -451,7 +463,7 @@ app.get('/api/audits', (req, res) => {
 });
 
 // Get Audit Details
-app.get('/api/audits/:id', (req, res) => {
+apiRouter.get('/audits/:id', (req, res) => {
   const audit = db.prepare('SELECT * FROM audits WHERE id = ?').get(req.params.id);
   if (!audit) {
     return res.status(404).json({ error: 'Audit not found' });
@@ -488,7 +500,7 @@ app.get('/api/audits/:id', (req, res) => {
 });
 
 // Cancel Audit
-app.post('/api/audits/:id/cancel', (req, res) => {
+apiRouter.post('/audits/:id/cancel', (req, res) => {
   const auditId = req.params.id;
   const job = activeAudits.get(auditId);
   if (job) {
@@ -500,7 +512,7 @@ app.post('/api/audits/:id/cancel', (req, res) => {
 });
 
 // Delete Audit
-app.delete('/api/audits/:id', (req, res) => {
+apiRouter.delete('/audits/:id', (req, res) => {
   const auditId = req.params.id;
   db.prepare('DELETE FROM findings WHERE audit_id = ?').run(auditId);
   db.prepare('DELETE FROM pages WHERE audit_id = ?').run(auditId);
@@ -510,14 +522,14 @@ app.delete('/api/audits/:id', (req, res) => {
 });
 
 // Update Executive Summary
-app.patch('/api/audits/:id/summary', (req, res) => {
+apiRouter.patch('/audits/:id/summary', (req, res) => {
   const { executive_summary } = req.body;
   db.prepare('UPDATE audits SET executive_summary = ? WHERE id = ?').run(executive_summary, req.params.id);
   res.json({ success: true, executive_summary });
 });
 
 // Before-and-After Audit Comparison
-app.post('/api/audits/compare', (req, res) => {
+apiRouter.post('/audits/compare', (req, res) => {
   const { auditId1, auditId2 } = req.body;
   if (!auditId1 || !auditId2) {
     return res.status(400).json({ error: 'Both auditId1 and auditId2 are required' });
@@ -567,11 +579,15 @@ app.post('/api/audits/compare', (req, res) => {
 });
 
 // Grounded AI Meta Tag Suggestion
-app.post('/api/ai/suggest-meta', (req, res) => {
+apiRouter.post('/ai/suggest-meta', (req, res) => {
   const { title, headings, metaDescription, sampleText } = req.body;
   const suggestion = generateSuggestedMeta(title, headings, metaDescription, sampleText);
   res.json(suggestion);
 });
+
+// Mount API routes under both /api and / so it works seamlessly on Vercel and local
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
 
 // Serve production frontend assets if built
 const distPath = path.join(__dirname, '..', 'dist');

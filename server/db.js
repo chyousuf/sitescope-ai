@@ -1,101 +1,10 @@
 const path = require('path');
 const fs = require('fs');
 
-const isVercel = process.env.VERCEL === '1' || !!process.env.NOW_REGION;
+const isVercel = process.env.VERCEL === '1' || !!process.env.NOW_REGION || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
 const dbPath = isVercel ? path.join('/tmp', 'sitescope.db') : path.join(__dirname, '..', 'data', 'sitescope.db');
 
-let db = null;
-
-try {
-  const Database = require('better-sqlite3');
-  const dbDir = path.dirname(dbPath);
-  if (!fs.existsSync(dbDir)) {
-    fs.mkdirSync(dbDir, { recursive: true });
-  }
-
-  db = new Database(dbPath);
-
-  // Initialize schema
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS audits (
-      id TEXT PRIMARY KEY,
-      url TEXT NOT NULL,
-      domain TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      audit_type TEXT NOT NULL DEFAULT 'single',
-      max_pages INTEGER DEFAULT 5,
-      pages_scanned INTEGER DEFAULT 0,
-      quality_score INTEGER DEFAULT 0,
-      seo_score INTEGER DEFAULT 0,
-      performance_score INTEGER DEFAULT 0,
-      executive_summary TEXT,
-      error_message TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      completed_at DATETIME
-    );
-
-    CREATE TABLE IF NOT EXISTS pages (
-      id TEXT PRIMARY KEY,
-      audit_id TEXT NOT NULL,
-      url TEXT NOT NULL,
-      status_code INTEGER,
-      title TEXT,
-      meta_description TEXT,
-      canonical TEXT,
-      h1 TEXT,
-      load_time_ms INTEGER,
-      desktop_screenshot TEXT,
-      mobile_screenshot TEXT,
-      html_size INTEGER,
-      redirect_chain_json TEXT,
-      FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS findings (
-      id TEXT PRIMARY KEY,
-      audit_id TEXT NOT NULL,
-      page_url TEXT,
-      category TEXT NOT NULL,
-      severity TEXT NOT NULL,
-      title TEXT NOT NULL,
-      description TEXT,
-      why_it_matters TEXT,
-      evidence TEXT,
-      suggested_fix TEXT,
-      effort TEXT,
-      verification_steps TEXT,
-      dedupe_key TEXT,
-      FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
-    );
-
-    CREATE TABLE IF NOT EXISTS performance_reports (
-      id TEXT PRIMARY KEY,
-      audit_id TEXT NOT NULL,
-      device TEXT NOT NULL,
-      score INTEGER DEFAULT 0,
-      fcp TEXT,
-      lcp TEXT,
-      cls TEXT,
-      speed_index TEXT,
-      tbt TEXT,
-      inp TEXT,
-      is_field_data INTEGER DEFAULT 0,
-      field_origin TEXT,
-      diagnostics_json TEXT,
-      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
-    );
-
-    CREATE INDEX IF NOT EXISTS idx_audits_domain ON audits(domain);
-    CREATE INDEX IF NOT EXISTS idx_findings_audit ON findings(audit_id);
-    CREATE INDEX IF NOT EXISTS idx_pages_audit ON pages(audit_id);
-  `);
-} catch (err) {
-  console.warn('better-sqlite3 unavailable (running in serverless fallback mode):', err.message);
-  db = createMemoryDb();
-}
-
-// Memory database fallback for serverless environments
+// Memory database fallback for serverless environments (or when better-sqlite3 is unavailable)
 function createMemoryDb() {
   const store = {
     audits: [],
@@ -111,35 +20,35 @@ function createMemoryDb() {
 
       return {
         get: (...params) => {
-          if (s.includes('count(*) as count FROM audits')) {
+          if (s.includes('count(*) as count FROM audits') || s.includes('COUNT(*) as count FROM audits') || s.includes('count(*) FROM audits')) {
             return { count: store.audits.length };
           }
-          if (s.includes('FROM audits WHERE id = ?')) {
+          if (s.includes('FROM audits') && s.includes('WHERE id = ?')) {
             const id = params[0];
             return store.audits.find(a => a.id === id) || null;
           }
           return null;
         },
         all: (...params) => {
-          if (s.includes('FROM audits a')) {
+          if (s.includes('FROM audits')) {
             return store.audits.map(a => ({
               ...a,
               findings_count: store.findings.filter(f => f.audit_id === a.id).length,
               critical_count: store.findings.filter(f => f.audit_id === a.id && f.severity === 'critical').length
             }));
           }
-          if (s.includes('FROM pages WHERE audit_id = ?')) {
+          if (s.includes('FROM pages') && s.includes('WHERE audit_id = ?')) {
             const auditId = params[0];
             return store.pages.filter(p => p.audit_id === auditId);
           }
-          if (s.includes('FROM findings WHERE audit_id = ?') || s.includes('FROM findings \n    WHERE audit_id = ?')) {
+          if (s.includes('FROM findings') && s.includes('WHERE audit_id = ?')) {
             const auditId = params[0];
             const rank = { critical: 1, high: 2, medium: 3, low: 4 };
             return store.findings
               .filter(f => f.audit_id === auditId)
               .sort((a, b) => (rank[a.severity] || 5) - (rank[b.severity] || 5));
           }
-          if (s.includes('FROM performance_reports WHERE audit_id = ?')) {
+          if (s.includes('FROM performance_reports') && s.includes('WHERE audit_id = ?')) {
             const auditId = params[0];
             return store.performance_reports.filter(p => p.audit_id === auditId);
           }
@@ -147,15 +56,37 @@ function createMemoryDb() {
         },
         run: (...params) => {
           if (s.includes('INSERT INTO audits')) {
-            const [id, url, domain, status, audit_type, max_pages, pages_scanned, quality_score, seo_score, performance_score, executive_summary, created_at, completed_at] = params;
-            store.audits.unshift({
-              id, url, domain, status: status || 'pending', audit_type: audit_type || 'single',
-              max_pages: max_pages || 5, pages_scanned: pages_scanned || 0,
-              quality_score: quality_score || 0, seo_score: seo_score || 0, performance_score: performance_score || 0,
-              executive_summary: executive_summary || null,
-              created_at: created_at || new Date().toISOString(),
-              completed_at: completed_at || null
-            });
+            if (params.length === 5) {
+              const [id, url, domain, auditType, maxPages] = params;
+              store.audits.unshift({
+                id, url, domain,
+                status: 'running',
+                audit_type: auditType || 'single',
+                max_pages: maxPages || 5,
+                pages_scanned: 0,
+                quality_score: 0,
+                seo_score: 0,
+                performance_score: 0,
+                executive_summary: null,
+                created_at: new Date().toISOString(),
+                completed_at: null
+              });
+            } else {
+              const [id, url, domain, status, audit_type, max_pages, pages_scanned, quality_score, seo_score, performance_score, executive_summary, created_at, completed_at] = params;
+              store.audits.unshift({
+                id, url, domain,
+                status: status || 'pending',
+                audit_type: audit_type || 'single',
+                max_pages: max_pages || 5,
+                pages_scanned: pages_scanned || 0,
+                quality_score: quality_score || 0,
+                seo_score: seo_score || 0,
+                performance_score: performance_score || 0,
+                executive_summary: executive_summary || null,
+                created_at: created_at || new Date().toISOString(),
+                completed_at: completed_at || null
+              });
+            }
             return { changes: 1 };
           }
           if (s.includes('INSERT INTO pages')) {
@@ -171,6 +102,15 @@ function createMemoryDb() {
           if (s.includes('INSERT INTO performance_reports')) {
             const [id, audit_id, device, score, fcp, lcp, cls, speed_index, tbt, inp, is_field_data, field_origin, diagnostics_json] = params;
             store.performance_reports.push({ id, audit_id, device, score, fcp, lcp, cls, speed_index, tbt, inp, is_field_data, field_origin, diagnostics_json, created_at: new Date().toISOString() });
+            return { changes: 1 };
+          }
+          if (s.includes('UPDATE audits SET status = ?, error_message = ? WHERE id = ?')) {
+            const [status, error_message, id] = params;
+            const item = store.audits.find(a => a.id === id);
+            if (item) {
+              item.status = status;
+              item.error_message = error_message;
+            }
             return { changes: 1 };
           }
           if (s.includes('UPDATE audits SET status = ? WHERE id = ?')) {
@@ -220,6 +160,102 @@ function createMemoryDb() {
       };
     }
   };
+}
+
+let db = null;
+
+if (isVercel) {
+  console.log('SiteScope AI: Running in Vercel serverless environment (using in-memory store)');
+  db = createMemoryDb();
+} else {
+  try {
+    const Database = require('better-sqlite3');
+    const dbDir = path.dirname(dbPath);
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true });
+    }
+
+    db = new Database(dbPath);
+
+    // Initialize schema
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS audits (
+        id TEXT PRIMARY KEY,
+        url TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        audit_type TEXT NOT NULL DEFAULT 'single',
+        max_pages INTEGER DEFAULT 5,
+        pages_scanned INTEGER DEFAULT 0,
+        quality_score INTEGER DEFAULT 0,
+        seo_score INTEGER DEFAULT 0,
+        performance_score INTEGER DEFAULT 0,
+        executive_summary TEXT,
+        error_message TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        completed_at DATETIME
+      );
+
+      CREATE TABLE IF NOT EXISTS pages (
+        id TEXT PRIMARY KEY,
+        audit_id TEXT NOT NULL,
+        url TEXT NOT NULL,
+        status_code INTEGER,
+        title TEXT,
+        meta_description TEXT,
+        canonical TEXT,
+        h1 TEXT,
+        load_time_ms INTEGER,
+        desktop_screenshot TEXT,
+        mobile_screenshot TEXT,
+        html_size INTEGER,
+        redirect_chain_json TEXT,
+        FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS findings (
+        id TEXT PRIMARY KEY,
+        audit_id TEXT NOT NULL,
+        page_url TEXT,
+        category TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        title TEXT NOT NULL,
+        description TEXT,
+        why_it_matters TEXT,
+        evidence TEXT,
+        suggested_fix TEXT,
+        effort TEXT,
+        verification_steps TEXT,
+        dedupe_key TEXT,
+        FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
+      );
+
+      CREATE TABLE IF NOT EXISTS performance_reports (
+        id TEXT PRIMARY KEY,
+        audit_id TEXT NOT NULL,
+        device TEXT NOT NULL,
+        score INTEGER DEFAULT 0,
+        fcp TEXT,
+        lcp TEXT,
+        cls TEXT,
+        speed_index TEXT,
+        tbt TEXT,
+        inp TEXT,
+        is_field_data INTEGER DEFAULT 0,
+        field_origin TEXT,
+        diagnostics_json TEXT,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_audits_domain ON audits(domain);
+      CREATE INDEX IF NOT EXISTS idx_findings_audit ON findings(audit_id);
+      CREATE INDEX IF NOT EXISTS idx_pages_audit ON pages(audit_id);
+    `);
+  } catch (err) {
+    console.warn('better-sqlite3 unavailable (running in serverless fallback mode):', err.message);
+    db = createMemoryDb();
+  }
 }
 
 // Seed initial audits if empty
