@@ -27,13 +27,15 @@ import {
   RotateCcw
 } from 'lucide-react';
 
+import { DEFAULT_AUDITS } from './data/defaultAudits';
+
 export default function App() {
   const [currentTab, setCurrentTab] = useState('workspace'); // 'audits', 'workspace', 'compare', 'report'
   const [workspaceSubTab, setWorkspaceSubTab] = useState('overview'); // 'overview', 'queue', 'quality', 'seo', 'speed'
   
-  const [allAudits, setAllAudits] = useState([]);
-  const [selectedAuditId, setSelectedAuditId] = useState('audit-demo-before-001');
-  const [selectedAudit, setSelectedAudit] = useState(null);
+  const [allAudits, setAllAudits] = useState(DEFAULT_AUDITS);
+  const [selectedAuditId, setSelectedAuditId] = useState(DEFAULT_AUDITS[0].id);
+  const [selectedAudit, setSelectedAudit] = useState(DEFAULT_AUDITS[0]);
   const [loadingAudit, setLoadingAudit] = useState(false);
 
   // Modals state
@@ -60,17 +62,23 @@ export default function App() {
       const res = await fetch('/api/audits');
       if (res.ok) {
         const data = await res.json();
-        setAllAudits(data);
-        if (data.length > 0 && !selectedAuditId) {
-          setSelectedAuditId(data[0].id);
+        if (Array.isArray(data) && data.length > 0) {
+          setAllAudits(data);
+          if (!selectedAuditId) {
+            setSelectedAuditId(data[0].id);
+          }
         }
       }
     } catch (err) {
-      console.error('Failed to fetch audits list:', err);
+      console.warn('Backend API offline or serverless cold start. Using cached audits.');
     }
   };
 
   const loadAuditDetails = async (id) => {
+    const localMatch = DEFAULT_AUDITS.find(a => a.id === id);
+    if (localMatch) {
+      setSelectedAudit(localMatch);
+    }
     setLoadingAudit(true);
     try {
       const res = await fetch(`/api/audits/${id}`);
@@ -79,7 +87,7 @@ export default function App() {
         setSelectedAudit(data);
       }
     } catch (err) {
-      console.error('Failed to load audit details:', err);
+      console.warn('Using local audit detail:', id);
     } finally {
       setLoadingAudit(false);
     }

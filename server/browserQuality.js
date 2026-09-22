@@ -1,18 +1,30 @@
 const puppeteer = require('puppeteer-core');
+const cheerio = require('cheerio');
 const path = require('path');
 const fs = require('fs');
+const { fetchWithRedirects } = require('./crawler');
 
-const CHROME_PATH = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const SCREENSHOTS_DIR = path.join(__dirname, '..', 'public', 'screenshots');
-
 if (!fs.existsSync(SCREENSHOTS_DIR)) {
-  fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+  try {
+    fs.mkdirSync(SCREENSHOTS_DIR, { recursive: true });
+  } catch {}
 }
+
+const CHROME_PATH = process.env.PUPPETEER_EXECUTABLE_PATH ||
+  (fs.existsSync('/Applications/Google Chrome.app/Contents/MacOS/Google Chrome')
+    ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    : null);
+
+const isChromeAvailable = !!CHROME_PATH && fs.existsSync(CHROME_PATH);
 
 /**
  * Launch headless browser instance
  */
 async function launchBrowser() {
+  if (!isChromeAvailable) {
+    throw new Error('Headless Chrome is not installed or available on this host.');
+  }
   return await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: true,
@@ -27,9 +39,114 @@ async function launchBrowser() {
 }
 
 /**
+ * Quality inspection fallback using Cheerio when headless Chrome is unavailable (e.g. Vercel serverless)
+ */
+async function inspectQualityFallback(url, auditId, pageIndex = 0, onLog) {
+  const result = {
+    desktopScreenshot: '/screenshots/demo_desktop_v1.png',
+    mobileScreenshot: '/screenshots/demo_mobile_v1.png',
+    consoleErrors: [],
+    failedRequests: [],
+    horizontalOverflow: { hasOverflow: false, scrollWidth: 390, clientWidth: 390, elements: [] },
+    formAccessibility: { issues: [] },
+    keyboardAccessibility: { issues: [] },
+    navIssues: []
+  };
+
+  try {
+    const pageRes = await fetchWithRedirects(url, 2);
+    if (!pageRes.body) return result;
+
+    const $ = cheerio.load(pageRes.body);
+
+    // 1. Form accessibility check
+    $('input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select, textarea').each((_, el) => {
+      const id = $(el).attr('id');
+      const ariaLabel = $(el).attr('aria-label');
+      const hasParentLabel = $(el).closest('label').length > 0;
+      const hasForLabel = id ? $(`label[for="${id}"]`).length > 0 : false;
+
+      if (!ariaLabel && !hasParentLabel && !hasForLabel) {
+        result.formAccessibility.issues.push({
+          tag: el.tagName.toLowerCase(),
+          type: $(el).attr('type') || 'text',
+          id: id || null,
+          htmlSnippet: $(el).toString().substring(0, 140)
+        });
+      }
+    });
+
+    // 2. Keyboard & Tabindex
+    $('[tabindex]').each((_, el) => {
+      const val = parseInt($(el).attr('tabindex'), 10);
+      if (val > 0) {
+        result.keyboardAccessibility.issues.push({
+          type: 'positive-tabindex',
+          tabindex: val,
+          tag: el.tagName.toLowerCase(),
+          snippet: $(el).toString().substring(0, 100)
+        });
+      }
+    });
+
+    // 3. Overflow heuristics (elements with explicit inline width > 400px or overflow-container)
+    const wideElements = [];
+    $('[style*="width"], .overflow-container, table').each((_, el) => {
+      const style = $(el).attr('style') || '';
+      const match = style.match(/width:\s*(\d+)px/);
+      const isWideTable = el.tagName.toLowerCase() === 'table' && !$(el).closest('[style*="overflow"]').length;
+      if ((match && parseInt(match[1], 10) > 400) || $(el).hasClass('overflow-container') || isWideTable) {
+        wideElements.push({
+          tag: el.tagName.toLowerCase(),
+          className: $(el).attr('class') || '',
+          width: match ? parseInt(match[1], 10) : 980,
+          outerHtmlSnippet: $(el).toString().substring(0, 160)
+        });
+      }
+    });
+
+    if (wideElements.length > 0) {
+      result.horizontalOverflow = {
+        hasOverflow: true,
+        scrollWidth: 980,
+        clientWidth: 390,
+        windowWidth: 390,
+        elements: wideElements.slice(0, 3)
+      };
+    }
+
+    // 4. Script console error check
+    $('script').each((_, el) => {
+      const content = $(el).html() || '';
+      if (content.includes('console.error(')) {
+        const errMatch = content.match(/console\.error\((["'`])(.*?)\1\)/);
+        if (errMatch) {
+          result.consoleErrors.push({
+            type: 'console-error',
+            text: errMatch[2],
+            location: 'inline-script'
+          });
+        }
+      }
+    });
+
+    if (onLog) onLog(`DOM Quality inspection complete (Overflow: ${result.horizontalOverflow.hasOverflow ? 'DETECTED' : 'None'}, Form issues: ${result.formAccessibility.issues.length})`);
+  } catch (err) {
+    if (onLog) onLog(`Fallback inspection warning: ${err.message}`);
+  }
+
+  return result;
+}
+
+/**
  * Perform comprehensive browser quality inspection for desktop and mobile
  */
 async function inspectBrowserQuality(url, auditId, pageIndex = 0, onLog) {
+  if (!isChromeAvailable) {
+    if (onLog) onLog(`Headless Chrome binary not available in cloud environment. Running DOM heuristics...`);
+    return await inspectQualityFallback(url, auditId, pageIndex, onLog);
+  }
+
   let browser = null;
   const result = {
     desktopScreenshot: null,

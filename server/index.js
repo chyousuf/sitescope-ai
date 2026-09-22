@@ -586,7 +586,11 @@ if (fs.existsSync(indexPath)) {
   });
 }
 
-// Start Server
-app.listen(PORT, () => {
-  console.log(`SiteScope AI backend running on http://localhost:${PORT}`);
-});
+module.exports = app;
+
+// Start Server if executed directly
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`SiteScope AI backend running on http://localhost:${PORT}`);
+  });
+}

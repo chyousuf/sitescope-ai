@@ -49,12 +49,44 @@ export default function AuditComparison({ allAudits = [], onSelectAudit }) {
       if (res.ok) {
         const data = await res.json();
         setComparisonData(data);
+        setLoading(false);
+        return;
       }
     } catch (err) {
-      console.error('Comparison error:', err);
-    } finally {
-      setLoading(false);
+      console.warn('Comparison API offline, calculating locally...');
     }
+
+    // Local client-side computation fallback
+    const a1 = allAudits.find(a => a.id === id1);
+    const a2 = allAudits.find(a => a.id === id2);
+    if (a1 && a2) {
+      const f1 = a1.findings || [];
+      const f2 = a2.findings || [];
+      const keys1 = new Set(f1.map(f => f.dedupe_key || f.title));
+      const keys2 = new Set(f2.map(f => f.dedupe_key || f.title));
+
+      const resolved = f1.filter(f => !keys2.has(f.dedupe_key || f.title));
+      const newIssues = f2.filter(f => !keys1.has(f.dedupe_key || f.title));
+      const persistent = f2.filter(f => keys1.has(f.dedupe_key || f.title));
+
+      setComparisonData({
+        audit1: a1,
+        audit2: a2,
+        scoreDeltas: {
+          quality: (a2.quality_score || 0) - (a1.quality_score || 0),
+          seo: (a2.seo_score || 0) - (a1.seo_score || 0),
+          performance: (a2.performance_score || 0) - (a1.performance_score || 0)
+        },
+        resolvedIssues: resolved,
+        newIssues: newIssues,
+        persistentIssues: persistent,
+        performance: {
+          audit1: a1.performanceReports || [],
+          audit2: a2.performanceReports || []
+        }
+      });
+    }
+    setLoading(false);
   };
 
   const handleRun = () => {

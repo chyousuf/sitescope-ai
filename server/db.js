@@ -1,94 +1,230 @@
-const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
 
-const dbPath = path.join(__dirname, '..', 'data', 'sitescope.db');
-const dbDir = path.dirname(dbPath);
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+const isVercel = process.env.VERCEL === '1' || !!process.env.NOW_REGION;
+const dbPath = isVercel ? path.join('/tmp', 'sitescope.db') : path.join(__dirname, '..', 'data', 'sitescope.db');
+
+let db = null;
+
+try {
+  const Database = require('better-sqlite3');
+  const dbDir = path.dirname(dbPath);
+  if (!fs.existsSync(dbDir)) {
+    fs.mkdirSync(dbDir, { recursive: true });
+  }
+
+  db = new Database(dbPath);
+
+  // Initialize schema
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS audits (
+      id TEXT PRIMARY KEY,
+      url TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      audit_type TEXT NOT NULL DEFAULT 'single',
+      max_pages INTEGER DEFAULT 5,
+      pages_scanned INTEGER DEFAULT 0,
+      quality_score INTEGER DEFAULT 0,
+      seo_score INTEGER DEFAULT 0,
+      performance_score INTEGER DEFAULT 0,
+      executive_summary TEXT,
+      error_message TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      completed_at DATETIME
+    );
+
+    CREATE TABLE IF NOT EXISTS pages (
+      id TEXT PRIMARY KEY,
+      audit_id TEXT NOT NULL,
+      url TEXT NOT NULL,
+      status_code INTEGER,
+      title TEXT,
+      meta_description TEXT,
+      canonical TEXT,
+      h1 TEXT,
+      load_time_ms INTEGER,
+      desktop_screenshot TEXT,
+      mobile_screenshot TEXT,
+      html_size INTEGER,
+      redirect_chain_json TEXT,
+      FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS findings (
+      id TEXT PRIMARY KEY,
+      audit_id TEXT NOT NULL,
+      page_url TEXT,
+      category TEXT NOT NULL,
+      severity TEXT NOT NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      why_it_matters TEXT,
+      evidence TEXT,
+      suggested_fix TEXT,
+      effort TEXT,
+      verification_steps TEXT,
+      dedupe_key TEXT,
+      FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS performance_reports (
+      id TEXT PRIMARY KEY,
+      audit_id TEXT NOT NULL,
+      device TEXT NOT NULL,
+      score INTEGER DEFAULT 0,
+      fcp TEXT,
+      lcp TEXT,
+      cls TEXT,
+      speed_index TEXT,
+      tbt TEXT,
+      inp TEXT,
+      is_field_data INTEGER DEFAULT 0,
+      field_origin TEXT,
+      diagnostics_json TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_audits_domain ON audits(domain);
+    CREATE INDEX IF NOT EXISTS idx_findings_audit ON findings(audit_id);
+    CREATE INDEX IF NOT EXISTS idx_pages_audit ON pages(audit_id);
+  `);
+} catch (err) {
+  console.warn('better-sqlite3 unavailable (running in serverless fallback mode):', err.message);
+  db = createMemoryDb();
 }
 
-const db = new Database(dbPath);
+// Memory database fallback for serverless environments
+function createMemoryDb() {
+  const store = {
+    audits: [],
+    pages: [],
+    findings: [],
+    performance_reports: []
+  };
 
-// Initialize schema
-db.exec(`
-  CREATE TABLE IF NOT EXISTS audits (
-    id TEXT PRIMARY KEY,
-    url TEXT NOT NULL,
-    domain TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending',
-    audit_type TEXT NOT NULL DEFAULT 'single',
-    max_pages INTEGER DEFAULT 5,
-    pages_scanned INTEGER DEFAULT 0,
-    quality_score INTEGER DEFAULT 0,
-    seo_score INTEGER DEFAULT 0,
-    performance_score INTEGER DEFAULT 0,
-    executive_summary TEXT,
-    error_message TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME
-  );
+  return {
+    exec: () => {},
+    prepare: (sql) => {
+      const s = sql.trim();
 
-  CREATE TABLE IF NOT EXISTS pages (
-    id TEXT PRIMARY KEY,
-    audit_id TEXT NOT NULL,
-    url TEXT NOT NULL,
-    status_code INTEGER,
-    title TEXT,
-    meta_description TEXT,
-    canonical TEXT,
-    h1 TEXT,
-    load_time_ms INTEGER,
-    desktop_screenshot TEXT,
-    mobile_screenshot TEXT,
-    html_size INTEGER,
-    redirect_chain_json TEXT,
-    FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
-  );
+      return {
+        get: (...params) => {
+          if (s.includes('count(*) as count FROM audits')) {
+            return { count: store.audits.length };
+          }
+          if (s.includes('FROM audits WHERE id = ?')) {
+            const id = params[0];
+            return store.audits.find(a => a.id === id) || null;
+          }
+          return null;
+        },
+        all: (...params) => {
+          if (s.includes('FROM audits a')) {
+            return store.audits.map(a => ({
+              ...a,
+              findings_count: store.findings.filter(f => f.audit_id === a.id).length,
+              critical_count: store.findings.filter(f => f.audit_id === a.id && f.severity === 'critical').length
+            }));
+          }
+          if (s.includes('FROM pages WHERE audit_id = ?')) {
+            const auditId = params[0];
+            return store.pages.filter(p => p.audit_id === auditId);
+          }
+          if (s.includes('FROM findings WHERE audit_id = ?') || s.includes('FROM findings \n    WHERE audit_id = ?')) {
+            const auditId = params[0];
+            const rank = { critical: 1, high: 2, medium: 3, low: 4 };
+            return store.findings
+              .filter(f => f.audit_id === auditId)
+              .sort((a, b) => (rank[a.severity] || 5) - (rank[b.severity] || 5));
+          }
+          if (s.includes('FROM performance_reports WHERE audit_id = ?')) {
+            const auditId = params[0];
+            return store.performance_reports.filter(p => p.audit_id === auditId);
+          }
+          return [];
+        },
+        run: (...params) => {
+          if (s.includes('INSERT INTO audits')) {
+            const [id, url, domain, status, audit_type, max_pages, pages_scanned, quality_score, seo_score, performance_score, executive_summary, created_at, completed_at] = params;
+            store.audits.unshift({
+              id, url, domain, status: status || 'pending', audit_type: audit_type || 'single',
+              max_pages: max_pages || 5, pages_scanned: pages_scanned || 0,
+              quality_score: quality_score || 0, seo_score: seo_score || 0, performance_score: performance_score || 0,
+              executive_summary: executive_summary || null,
+              created_at: created_at || new Date().toISOString(),
+              completed_at: completed_at || null
+            });
+            return { changes: 1 };
+          }
+          if (s.includes('INSERT INTO pages')) {
+            const [id, audit_id, url, status_code, title, meta_description, canonical, h1, load_time_ms, desktop_screenshot, mobile_screenshot, html_size] = params;
+            store.pages.push({ id, audit_id, url, status_code, title, meta_description, canonical, h1, load_time_ms, desktop_screenshot, mobile_screenshot, html_size });
+            return { changes: 1 };
+          }
+          if (s.includes('INSERT INTO findings')) {
+            const [id, audit_id, page_url, category, severity, title, description, why_it_matters, evidence, suggested_fix, effort, verification_steps, dedupe_key] = params;
+            store.findings.push({ id, audit_id, page_url, category, severity, title, description, why_it_matters, evidence, suggested_fix, effort, verification_steps, dedupe_key });
+            return { changes: 1 };
+          }
+          if (s.includes('INSERT INTO performance_reports')) {
+            const [id, audit_id, device, score, fcp, lcp, cls, speed_index, tbt, inp, is_field_data, field_origin, diagnostics_json] = params;
+            store.performance_reports.push({ id, audit_id, device, score, fcp, lcp, cls, speed_index, tbt, inp, is_field_data, field_origin, diagnostics_json, created_at: new Date().toISOString() });
+            return { changes: 1 };
+          }
+          if (s.includes('UPDATE audits SET status = ? WHERE id = ?')) {
+            const [status, id] = params;
+            const item = store.audits.find(a => a.id === id);
+            if (item) item.status = status;
+            return { changes: 1 };
+          }
+          if (s.includes('UPDATE audits SET executive_summary = ? WHERE id = ?')) {
+            const [executive_summary, id] = params;
+            const item = store.audits.find(a => a.id === id);
+            if (item) item.executive_summary = executive_summary;
+            return { changes: 1 };
+          }
+          if (s.includes('UPDATE audits SET') && s.includes('completed_at')) {
+            const [pages_scanned, quality_score, seo_score, performance_score, executive_summary, id] = params;
+            const item = store.audits.find(a => a.id === id);
+            if (item) {
+              item.status = 'completed';
+              item.pages_scanned = pages_scanned;
+              item.quality_score = quality_score;
+              item.seo_score = seo_score;
+              item.performance_score = performance_score;
+              item.executive_summary = executive_summary;
+              item.completed_at = new Date().toISOString();
+            }
+            return { changes: 1 };
+          }
+          if (s.includes('DELETE FROM findings WHERE audit_id = ?')) {
+            store.findings = store.findings.filter(f => f.audit_id !== params[0]);
+            return { changes: 1 };
+          }
+          if (s.includes('DELETE FROM pages WHERE audit_id = ?')) {
+            store.pages = store.pages.filter(p => p.audit_id !== params[0]);
+            return { changes: 1 };
+          }
+          if (s.includes('DELETE FROM performance_reports WHERE audit_id = ?')) {
+            store.performance_reports = store.performance_reports.filter(p => p.audit_id !== params[0]);
+            return { changes: 1 };
+          }
+          if (s.includes('DELETE FROM audits WHERE id = ?')) {
+            store.audits = store.audits.filter(a => a.id !== params[0]);
+            return { changes: 1 };
+          }
+          return { changes: 0 };
+        }
+      };
+    }
+  };
+}
 
-  CREATE TABLE IF NOT EXISTS findings (
-    id TEXT PRIMARY KEY,
-    audit_id TEXT NOT NULL,
-    page_url TEXT,
-    category TEXT NOT NULL, -- 'quality', 'seo', 'speed'
-    severity TEXT NOT NULL, -- 'critical', 'high', 'medium', 'low'
-    title TEXT NOT NULL,
-    description TEXT,
-    why_it_matters TEXT,
-    evidence TEXT,
-    suggested_fix TEXT,
-    effort TEXT, -- 'Quick Fix (<15m)', 'Moderate (1-2h)', 'Complex (4h+)'
-    verification_steps TEXT,
-    dedupe_key TEXT,
-    FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
-  );
-
-  CREATE TABLE IF NOT EXISTS performance_reports (
-    id TEXT PRIMARY KEY,
-    audit_id TEXT NOT NULL,
-    device TEXT NOT NULL, -- 'mobile', 'desktop'
-    score INTEGER DEFAULT 0,
-    fcp TEXT,
-    lcp TEXT,
-    cls TEXT,
-    speed_index TEXT,
-    tbt TEXT,
-    inp TEXT,
-    is_field_data INTEGER DEFAULT 0,
-    field_origin TEXT,
-    diagnostics_json TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY(audit_id) REFERENCES audits(id) ON DELETE CASCADE
-  );
-
-  CREATE INDEX IF NOT EXISTS idx_audits_domain ON audits(domain);
-  CREATE INDEX IF NOT EXISTS idx_findings_audit ON findings(audit_id);
-  CREATE INDEX IF NOT EXISTS idx_pages_audit ON pages(audit_id);
-`);
-
-// Pre-seed sample "Before" and "After" audits for immediate demonstration if empty
+// Seed initial audits if empty
 const countStmt = db.prepare('SELECT count(*) as count FROM audits').get();
-if (countStmt.count === 0) {
+if (countStmt && countStmt.count === 0) {
   seedInitialAudits();
 }
 
@@ -114,22 +250,22 @@ function seedInitialAudits() {
   `);
 
   const now = new Date();
-  const pastDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000); // 3 days ago
+  const pastDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
 
   // 1. Audit V1: Before Fixes
   const auditIdV1 = 'audit-demo-before-001';
   insertAudit.run(
     auditIdV1,
     'http://localhost:3001/api/demo-site',
-    'localhost:3001',
+    'acmecloud.com',
     'completed',
     'crawl',
     3,
     3,
-    52, // Quality score
-    58, // SEO score
-    46, // Speed score
-    `Executive Audit Summary for Acme Cloud Services (Initial Run):
+    52,
+    58,
+    46,
+    `Executive Audit Summary for acmecloud.com (Initial Run):
 The initial audit discovered 6 high-priority issues that directly impact search engine indexing, mobile conversions, and customer trust. Crucially, the mobile viewport suffers from visible horizontal layout overflow caused by an unconstrained 980px table, preventing mobile shoppers from viewing pricing details. Furthermore, a 404 broken link on the primary navigation button disrupts user flow, and the primary H1 tag is missing. Page speed is hindered by 1.4MB of uncompressed PNG banners and render-blocking scripts. Recommended priority: resolve mobile overflow and 404 links first.`,
     pastDate.toISOString(),
     pastDate.toISOString()
@@ -141,9 +277,9 @@ The initial audit discovered 6 high-priority issues that directly impact search 
     'http://localhost:3001/api/demo-site',
     200,
     'Acme SaaS',
-    '', // missing meta description
-    'http://staging.acmeservices.fake/home', // inconsistent canonical
-    null, // missing H1
+    '',
+    'http://staging.acmeservices.fake/home',
+    null,
     1450,
     '/screenshots/demo_desktop_v1.png',
     '/screenshots/demo_mobile_v1.png',
@@ -268,12 +404,12 @@ The initial audit discovered 6 high-priority issues that directly impact search 
     auditIdV1,
     'mobile',
     46,
-    '3.2s', // FCP
-    '4.6s', // LCP
-    '0.28', // CLS
-    '5.4s', // Speed Index
-    '680ms', // TBT
-    '340ms', // INP
+    '3.2s',
+    '4.6s',
+    '0.28',
+    '5.4s',
+    '680ms',
+    '340ms',
     1,
     'URL-level',
     JSON.stringify([
@@ -307,15 +443,15 @@ The initial audit discovered 6 high-priority issues that directly impact search 
   insertAudit.run(
     auditIdV2,
     'http://localhost:3001/api/demo-site-fixed',
-    'localhost:3001',
+    'acmecloud.com',
     'completed',
     'crawl',
     3,
     3,
-    98, // Quality score
-    96, // SEO score
-    94, // Speed score
-    `Post-Fix Verification Report for Acme Cloud Services:
+    98,
+    96,
+    94,
+    `Post-Fix Verification Report for acmecloud.com:
 A follow-up inspection was conducted after implementing agency remediations. All critical blockers have been successfully resolved:
 1. Horizontal mobile overflow eliminated by migrating the pricing matrix to responsive CSS grid.
 2. The broken 404 pricing link was corrected to the live endpoint.
@@ -341,7 +477,6 @@ A follow-up inspection was conducted after implementing agency remediations. All
     28400
   );
 
-  // V2 has only 1 low-priority minor suggestion remaining
   insertFinding.run(
     'f1-v2',
     auditIdV2,
@@ -358,18 +493,17 @@ A follow-up inspection was conducted after implementing agency remediations. All
     'missing-organization-schema'
   );
 
-  // Perf reports V2
   insertPerf.run(
     'perf-v2-mob',
     auditIdV2,
     'mobile',
     94,
-    '1.1s', // FCP
-    '1.6s', // LCP
-    '0.02', // CLS
-    '1.8s', // Speed Index
-    '80ms', // TBT
-    '95ms', // INP
+    '1.1s',
+    '1.6s',
+    '0.02',
+    '1.8s',
+    '80ms',
+    '95ms',
     1,
     'URL-level',
     JSON.stringify([
