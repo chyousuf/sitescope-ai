@@ -1,4 +1,3 @@
-const puppeteer = require('puppeteer-core');
 const cheerio = require('cheerio');
 const path = require('path');
 const fs = require('fs');
@@ -25,6 +24,8 @@ async function launchBrowser() {
   if (!isChromeAvailable) {
     throw new Error('Headless Chrome is not installed or available on this host.');
   }
+  const puppeteerModule = await import('puppeteer-core');
+  const puppeteer = puppeteerModule.default || puppeteerModule;
   return await puppeteer.launch({
     executablePath: CHROME_PATH,
     headless: true,
